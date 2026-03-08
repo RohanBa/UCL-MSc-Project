@@ -1,0 +1,631 @@
+---
+title: "out_of_sample_models_male"
+author: '18004789'
+date: "2025-08-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(rstudioapi)
+library(rstan)
+library(shinystan)
+library(ggplot2)
+library(bayesplot)
+library(gridExtra)
+library(MASS)
+```
+
+```{r}
+X100M_male <- read_excel("100m/100m/100M_male.xls")
+X100M_male$Gender <- "M"
+# Add a new column 'Year' by extracting the year from 'Date'
+X100M_male$Year <- as.numeric(format(X100M_male$Date, "%Y"))
+
+sb_df <- X100M_male %>%
+  group_by(original_ID, Year) %>%
+  # Only keep if there are at least 3 performances in that year
+  filter(n() >= 3) %>%
+  slice(which.min(Result)) %>%
+  ungroup()
+sb_df$AgeInt <- sb_df$Year - as.numeric(format(sb_df$DOB, "%Y"))
+
+trim_sb <- sb_df %>%
+  group_by(AgeInt) %>%
+  filter(AgeInt >= 17, AgeInt <= 30) %>% # now consider only ages 17 to 30
+  ungroup()
+
+# cutting down size of data
+# Include athletes with at least 5 years of SBs
+trim_sb <- trim_sb %>%
+  group_by(original_ID) %>%
+  filter(n() >= 5) %>%
+  ungroup()
+
+# Restrict to elite athletes
+
+elite_athletes <- trim_sb %>%
+  group_by(original_ID) %>%
+  summarise(PB = min(Result, na.rm = TRUE)) %>%
+  filter(PB < 10.5)
+
+# Keep only SBs for elite athletes
+trim_sb <- trim_sb %>%
+  semi_join(elite_athletes, by = "original_ID")
+```
+
+```{r}
+# Create a list of observed ages for each athlete
+trim_observed_ages <-trim_sb %>%
+  group_by(original_ID, Competitor) %>%
+  summarise(M_i = list(AgeInt), count = n(), y_i = list(Result)) %>%
+  ungroup()
+
+trim_observed_ages$all_ages <- list(sort(unique(trim_sb$AgeInt)))
+
+# getting indicies of observed ages in relation to the vector of all unique ages
+trim_observed_ages$age_indices <- lapply(trim_observed_ages$M_i, function(x) {
+  match(x, trim_observed_ages$all_ages[[1]])
+})
+```
+
+```{r}
+# Preparing data for stan model
+
+J <- length(unique(trim_sb$AgeInt))
+N <- nrow(trim_observed_ages)
+# Maximum number of observations any athlete has
+max_obs <- max(trim_observed_ages$count)
+
+# Putting the vectors of ageIndicies into an Nxmax_obs matrix
+age_idx <- matrix(1, nrow = N, ncol = max_obs)
+for (i in 1:N) {
+  inds <- trim_observed_ages$age_indices[[i]]
+  len_i <- length(inds)
+  age_idx[i, 1:len_i] <- inds
+}
+
+# Putting the vectors of results into an Nxmax_obs matrix
+y_matrix <- matrix(0, nrow = N, ncol = max_obs)
+for(i in 1:N) {
+  obs_values <- trim_observed_ages$y_i[[i]]
+  n_obs <- length(obs_values)
+  y_matrix[i, 1:n_obs] <- obs_values
+}
+```
+
+
+```{r}
+# Random effect is slightly different
+
+y_matrix_re <- matrix(0, nrow = N, ncol = J)
+
+for (i in 1:N) {
+  a_idx <- trim_observed_ages$age_indices[[i]]
+  y_vals <- trim_observed_ages$y_i[[i]]
+  y_matrix_re[i, a_idx] <- y_vals
+}
+
+
+y_matrix_re_masked <- y_matrix_re
+
+
+for (i in 1:nrow(y_matrix_re)) {
+  nz <- which(y_matrix_re[i, ] != 0)      # indices of non-zero entries
+  if (length(nz) > 0) {
+    last_nz <- tail(nz, 1)       # final non-zero index
+    y_matrix_re_masked[i, last_nz] <- 0   # mask it
+  }
+}
+
+missing_positions <- matrix(as.integer(y_matrix_re_masked == 0), nrow = N, ncol = J)
+
+row_means <- apply(y_matrix_re_masked, 1, function(x) {
+  vals <- x[x != 0]
+  if (length(vals) == 0) NA else mean(vals)
+})
+
+mean(row_means)
+
+
+# Build the Stan data list:
+oos_stan_data <- list(
+  N = N,                # number of athletes
+  J = J,                # number of unique ages
+  y = y_matrix_re_masked,           # the observed y matrix (N x J)
+  unique_ages = trim_observed_ages$all_ages[[1]],  # vector of unique ages (22,23,24,25,26)
+  missing_positions = missing_positions  # Pass missingness indicator
+)
+```
+
+
+
+```{r}
+# mask the final observed y values and save as vector
+obs_count = trim_observed_ages$count
+
+masked_y <- numeric(N)
+masked_age_indicies <- numeric(N)
+y_matrix_masked <- y_matrix
+age_idx_masked <- age_idx
+
+for (n in 1:N) {
+  k <- obs_count[n]
+  masked_y[n] <- y_matrix[n, k]
+  masked_age_indicies[n] <- age_idx[n, k]
+  y_matrix_masked[n, k] <- 0
+  age_idx_masked[n, k] <- 1
+}
+```
+
+```{r}
+obs_count_oos <- obs_count - 1
+
+# Out of sample stan data list:
+oos_stan_data <- list(
+  N = N,                # number of athletes
+  J = J,                # number of unique ages
+  max_obs = max_obs,    # maximum observations per subject
+  obs_count = obs_count_oos,  # vector of observation counts per subject minus 1
+  age_idx = age_idx_masked,    # matrix of precomputed age indices per subject w/o final obs
+  y = y_matrix_masked,         # padded y matrix with athletes' observed results w/o final obs
+  unique_ages = trim_observed_ages$all_ages[[1]],  # vector of unique ages 
+  center_age = 23.5
+)
+```
+
+```{r}
+# random effect model
+re_model <- stan_model('athlete.stan')
+
+# fixed effect model
+# simple_full <- stan_model('simple_full.stan')
+
+# mixed effect model
+# complex_full <- stan_model('complex_full.stan')
+
+# 1st order random walk
+# rw_model <- stan_model('random walk.stan')
+
+# 2nd order random walk
+# rw2_model <- stan_model('2ndorder_rw.stan')
+```
+
+```{r}
+init_fun <- function() {
+  list(
+    sigma = rep(0.1, stan_data$J),
+    Omega = diag(1, stan_data$J),
+    gamma = matrix(10, nrow = stan_data$N, ncol = stan_data$J),
+    gamma_0 = rep(10.41, stan_data$J),
+    sigma_y = 0.1
+  )
+}
+
+oos_re_fit_3000 <- sampling(re_model, data = oos_stan_data, init = init_fun, iter = 3000, chains = 1)
+```
+
+
+```{r}
+saveRDS(oos_re_fit_3000, "oos_re_fit_3000")
+```
+
+
+```{r}
+oos_fe_fit_3000<- readRDS(file = 'oos_fe_fit_3000.rds')
+oos_me_fit_3000<- readRDS(file = 'oos_me_fit_3000.rds')
+oos_rw1_fit_3000<- readRDS(file = 'oos_rw1_fit_3000.rds')
+oos_rw2_fit_3000<- readRDS(file = 'oos_rw2_fit_3000.rds')
+```
+
+
+
+```{r}
+unique_ages = trim_observed_ages$all_ages[[1]]
+
+# posterior_re_oos <- extract(oos_re_fit_3000)
+posterior_fe_oos <- extract(oos_fe_fit_3000)
+posterior_me_oos <- extract(oos_me_fit_3000)
+posterior_rw <- extract(oos_rw1_fit_3000)
+posterior_rw2 <- extract(oos_rw2_fit_3000)
+```
+
+```{r}
+# gamma_re_samples <- posterior_re_oos$gamma
+# sigy_re_samples <- posterior_re_oos$sigma_y
+# Sigma_re_draws <- posterior_re_oos$Sigma
+
+beta_fe_samples <- posterior_fe_oos$beta
+Sigma_fe_draws <- posterior_fe_oos$Sigma
+
+beta_me_samples <- posterior_me_oos$beta
+gamma_me_samples <- posterior_me_oos$gamma
+sigy_me_samples <- posterior_me_oos$sigma_y
+Sigma_me_draws <- posterior_me_oos$Sigma
+
+
+beta_rw_samples <- posterior_rw$beta
+gamma_rw_samples <- posterior_rw$gamma
+sigy_rw_samples <- posterior_rw$sigma_y
+
+
+beta_rw2_samples <- posterior_rw2$beta
+gamma_rw2_samples <- posterior_rw2$gamma
+sigy_rw2_samples <- posterior_rw2$sigma_y
+```
+
+
+
+
+
+
+```{r}
+set.seed(123)
+n <- 6          # athlete
+k <- obs_count_oos[n]     # number of observed ages for this athlete
+obs_idx <- age_idx[n, 1:k]          # indices of observed ages (e.g., [1, 2, 5, 7])
+y_obs <- y_matrix[n, 1:k]           # observed performances
+
+# The ages to predict performance for (the "future" ages)
+all_age_idx <- 1:J
+
+S <- 1500
+
+# Matrix to store posterior predictive samples for each future age
+pred_draws <- matrix(NA, nrow = J, ncol = S)
+
+for (s in 1:S) {
+  mu <- as.vector(X_poly %*% beta_me_samples[s, ]) + gamma_me_samples[s, n, ]
+  sigy <- sigy_me_samples[s]
+
+  pred_draws[, s] <- rnorm(length(mu), mu, sigy)
+
+}
+
+# Summarize posterior predictive at each future age
+pred_median <- apply(pred_draws, 1, median)
+pred_lower  <- apply(pred_draws, 1, quantile, 0.025)
+pred_upper  <- apply(pred_draws, 1, quantile, 0.975)
+
+future_ages <- unique_ages[future_idx]
+
+df_rw_pred <- data.frame(
+  age = unique_ages,
+  median = pred_median,
+  lower = pred_lower,
+  upper = pred_upper
+)
+
+df_obs <- data.frame(
+  age = unique_ages[obs_idx],
+  observed = y_obs
+)
+
+ggplot() +
+  geom_ribbon(data = df_rw_pred, aes(x = age, ymin = lower, ymax = upper, fill = "95% CI"), alpha = 0.3) +
+  geom_line(data = df_rw_pred, aes(x = age, y = median, color = "posterior median"), size = 1) +
+  geom_point(data = df_obs, aes(x = age, y = observed, color = "observed"), size = 2) +
+  scale_color_manual(values = c("posterior median" = "blue", "observed" = "black"), name = NULL) +
+  scale_fill_manual(values = c("95% CI" = "blue"), name = NULL) +
+  labs(title = paste("Posterior unobserved estimates for athlete", n), x = "Age", y = "Performance")
+```
+
+
+```{r}
+# Remove athletes where masked y is of age 30
+non_30_athlete_indicies <- which(masked_age_indicies != 14)
+# which(masked_age_indicies != 14)
+
+masked_y[non_30_athlete_indicies]
+```
+
+```{r}
+# Random effect - check/verify this
+
+set.seed(123)
+
+oos_re_mean <- numeric(length(non_30_athlete_indicies))
+
+for (ii in seq_along(non_30_athlete_indicies)) {
+  n <- non_30_athlete_indicies[ii]                       # actual athlete index
+  future_idx <- age_idx[n, obs_count[n]]
+  oos <- numeric(S)
+
+  for (s in 1:S) {
+    mu <- gamma_re_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_re_samples[s]
+    oos[s] <- rnorm(1, mu_pred, sigy)
+  }
+
+  oos_re_mean[ii] <- mean(oos)
+}
+
+rmse_re <- sqrt(mean((oos_re_mean - masked_y[non_30_athlete_indicies])^2))
+print(rmse_re)
+```
+
+
+
+```{r}
+# Fixed effect
+
+set.seed(123)
+
+oos_fe_mean <- numeric(length(non_30_athlete_indicies))
+
+for (ii in seq_along(non_30_athlete_indicies)){
+  n <- non_30_athlete_indicies[ii]
+  k <- obs_count_oos[n]
+  # future index is the masked y value index
+  future_idx <- age_idx[n, obs_count[n]]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+  
+  oos <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_fe_samples[s, ])
+    Sigma <- Sigma_fe_draws[s, , ]
+    
+    mu_obs <- mu[obs_idx]
+    mu_pred <- mu[future_idx]
+    
+    # Partition covariance
+    Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    Sigma_21 <- Sigma[obs_idx, future_idx, drop = FALSE]
+    Sigma_12 <- Sigma[future_idx, obs_idx, drop = FALSE]
+    Sigma_11 <- Sigma[future_idx, future_idx, drop = FALSE]
+    
+    # singular 'final' age being predicted, so univariate case for conditional
+    mu_cond <- as.numeric(mu_pred + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs))
+    sigma2_cond <- as.numeric(Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21))
+    oos[s] <- rnorm(1, mu_cond, sqrt(sigma2_cond))
+  }
+  
+  oos_fe_mean[ii] <- mean(oos)
+
+}
+
+rmse_fe <- sqrt(mean((oos_fe_mean - masked_y[non_30_athlete_indicies])^2))
+print(rmse_fe)
+```
+
+```{r}
+# Mixed effect
+
+set.seed(123)
+
+oos_me_mean <- numeric(length(non_30_athlete_indicies))
+
+for (ii in seq_along(non_30_athlete_indicies)) {
+  n <- non_30_athlete_indicies[ii]                       # actual athlete index
+  future_idx <- age_idx[n, obs_count[n]]
+  oos <- numeric(S)
+
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_me_samples[s, ]) + gamma_me_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_me_samples[s]
+    oos[s] <- rnorm(1, mu_pred, sigy)
+  }
+
+  oos_me_mean[ii] <- mean(oos)
+}
+
+rmse_me <- sqrt(mean((oos_me_mean - masked_y[non_30_athlete_indicies])^2))
+print(rmse_me)
+```
+
+```{r}
+# 1st order Random walk
+
+set.seed(123)
+
+oos_rw_mean <- numeric(length(non_30_athlete_indicies))  
+
+for (ii in seq_along(non_30_athlete_indicies)) {
+  n <- non_30_athlete_indicies[ii]
+  future_idx <- age_idx[n, obs_count[n]]
+  oos <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_rw_samples[s, ]) + gamma_rw_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_rw_samples[s]
+    oos[s] <- rnorm(1, mu_pred, sigy)
+  }
+  
+  oos_rw_mean[ii] <- mean(oos)
+}
+
+rmse_rw <- sqrt(mean((oos_rw_mean - masked_y[non_30_athlete_indicies])^2))
+print(rmse_rw)
+```
+```{r}
+# 2nd order Random walk
+
+set.seed(123)
+
+oos_rw2_mean <- numeric(length(non_30_athlete_indicies)) 
+
+for (ii in seq_along(non_30_athlete_indicies)) {
+  n <- non_30_athlete_indicies[ii]
+  future_idx <- age_idx[n, obs_count[n]]
+  oos <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_rw2_samples[s, ]) + gamma_rw2_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_rw2_samples[s]
+    oos[s] <- rnorm(1, mu_pred, sigy)
+  }
+  
+  oos_rw2_mean[ii] <- mean(oos)
+}
+
+rmse_rw2 <- sqrt(mean((oos_rw2_mean - masked_y[non_30_athlete_indicies])^2))
+print(rmse_rw2)
+```
+
+
+
+
+
+```{r}
+# numerically-stable log-mean-exp
+log_mean_exp <- function(log_dens) {
+  m <- max(log_dens)
+  m + log(mean(exp(log_dens - m)))
+}
+```
+
+```{r}
+# Random effect model
+
+lpd <- numeric(length(non_30_athlete_indicies)) 
+
+for (ii in seq_along(non_30_athlete_indicies)){
+  n <- non_30_athlete_indicies[ii] 
+  # minus 1 since we removed final y as a test
+  k <- obs_count[n]-1
+  # future index is the masked y value index
+  future_idx <- age_idx[n, obs_count[n]]
+  
+  log_dens_s <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- gamma_re_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_re_samples[s]
+    log_dens_s[s] <- dnorm(masked_y[n], mean = mu_pred, sd = sigy, log = TRUE)
+  }
+  lpd[ii] <- log_mean_exp(log_dens_s)
+}
+
+# log predictive score (negative average log predictive density)
+LPS_re <- -mean(lpd, na.rm = TRUE)
+print(LPS_re)
+```
+
+```{r}
+# Fixed effect model
+
+lpd <- numeric(length(non_30_athlete_indicies)) 
+
+for (ii in seq_along(non_30_athlete_indicies)){
+  n <- non_30_athlete_indicies[ii] 
+  k <- obs_count[n]-1
+  future_idx <- age_idx[n, obs_count[n]]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+  
+  log_dens_s <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_fe_samples[s, ])
+    Sigma <- Sigma_fe_draws[s, , ]
+    
+    mu_obs <- mu[obs_idx]
+    mu_pred <- mu[future_idx]
+    
+    Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    Sigma_21 <- Sigma[obs_idx, future_idx, drop = FALSE]
+    Sigma_12 <- Sigma[future_idx, obs_idx, drop = FALSE]
+    Sigma_11 <- Sigma[future_idx, future_idx, drop = FALSE]
+    
+    mu_cond <- as.numeric(mu_pred + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs))
+    sigma2_cond <- as.numeric(Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21))
+    
+    log_dens_s[s] <- dnorm(masked_y[n], mean = mu_cond, sd = sqrt(sigma2_cond), log = TRUE)
+  }
+  lpd[ii] <- log_mean_exp(log_dens_s)
+}
+
+# log predictive score (negative average log predictive density)
+LPS_fe <- -mean(lpd, na.rm = TRUE)
+print(LPS_fe)
+```
+
+```{r}
+# Mixed effect model
+
+lpd <- numeric(length(non_30_athlete_indicies)) 
+
+for (ii in seq_along(non_30_athlete_indicies)){
+  n <- non_30_athlete_indicies[ii] 
+  # minus 1 since we removed final y as a test
+  k <- obs_count[n]-1
+  # future index is the masked y value index
+  future_idx <- age_idx[n, obs_count[n]]
+  
+  log_dens_s <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_me_samples[s, ]) + gamma_me_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_me_samples[s]
+    log_dens_s[s] <- dnorm(masked_y[n], mean = mu_pred, sd = sigy, log = TRUE)
+  }
+  lpd[ii] <- log_mean_exp(log_dens_s)
+}
+
+# log predictive score (negative average log predictive density)
+LPS_me <- -mean(lpd, na.rm = TRUE)
+print(LPS_me)
+```
+
+```{r}
+# 1st Order Random walk model
+
+lpd <- numeric(length(non_30_athlete_indicies)) 
+
+for (ii in seq_along(non_30_athlete_indicies)){
+  n <- non_30_athlete_indicies[ii] 
+  k <- obs_count[n]-1
+  future_idx <- age_idx[n, obs_count[n]]
+  
+  log_dens_s <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_rw_samples[s, ]) + gamma_rw_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_rw_samples[s]
+    log_dens_s[s] <- dnorm(masked_y[n], mean = mu_pred, sd = sigy, log = TRUE)
+  }
+  lpd[ii] <- log_mean_exp(log_dens_s)
+}
+
+LPS_rw <- -mean(lpd, na.rm = TRUE)
+print(LPS_rw)
+```
+
+```{r}
+# 2nd Order Random walk model
+
+lpd <- numeric(length(non_30_athlete_indicies)) 
+
+for (ii in seq_along(non_30_athlete_indicies)){
+  n <- non_30_athlete_indicies[ii]
+  k <- obs_count[n]-1
+  future_idx <- age_idx[n, obs_count[n]]
+  
+  log_dens_s <- numeric(S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_rw2_samples[s, ]) + gamma_rw2_samples[s, n, ]
+    mu_pred <- mu[future_idx]
+    sigy <- sigy_rw2_samples[s]
+    log_dens_s[s] <- dnorm(masked_y[n], mean = mu_pred, sd = sigy, log = TRUE)
+  }
+  lpd[ii] <- log_mean_exp(log_dens_s)
+}
+
+LPS_rw2 <- -mean(lpd, na.rm = TRUE)
+print(LPS_rw2)
+```

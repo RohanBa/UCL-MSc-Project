@@ -1,0 +1,345 @@
+---
+title: "plots"
+author: '18004789'
+date: "2025-08-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(rstudioapi)
+library(rstan)
+library(shinystan)
+library(ggplot2)
+library(bayesplot)
+library(gridExtra)
+```
+
+```{r}
+set.seed(123)
+
+n_draws <- 1500
+
+# Posterior for the mean curve (no Sigma)
+mu_draws <- matrix(NA, nrow = J, ncol = n_draws)
+for (s in 1:n_draws) {
+  mu_draws[, s] <- as.vector(X_poly %*% beta_samples[s, ])
+}
+mu_median <- apply(mu_draws, 1, median)
+mu_lower  <- apply(mu_draws, 1, quantile, 0.025)
+mu_upper  <- apply(mu_draws, 1, quantile, 0.975)
+
+y_rep_draws <- matrix(NA, nrow = J, ncol = n_draws)
+for (s in 1:n_draws) {
+  mu_s <- as.numeric(mu_draws[, s])
+  Sigma_s <- as.matrix(Sigma_samples[s, , ])
+  # Draw a synthetic vector of performances at all ages for this athlete
+  y_rep_draws[, s] <- MASS::mvrnorm(1, mu = mu_s, Sigma = Sigma_s)
+}
+y_pred_median <- apply(y_rep_draws, 1, median)
+y_pred_lower  <- apply(y_rep_draws, 1, quantile, 0.025)
+y_pred_upper  <- apply(y_rep_draws, 1, quantile, 0.975)
+
+n <- 44   #240 279
+ages_n <- age_idx[n, 1:obs_count[n]]
+obs_perf <- y_matrix[n, 1:obs_count[n]]
+
+plot_df <- data.frame(
+  age = unique_ages,
+  mu_median = mu_median,
+  mu_lower = mu_lower,
+  mu_upper = mu_upper,
+  y_pred_median = y_pred_median,
+  y_pred_lower = y_pred_lower,
+  y_pred_upper = y_pred_upper
+)
+
+ggplot(plot_df, aes(x = age)) +
+  # Predictive interval ribbon (widest, includes Sigma)
+  # geom_ribbon(aes(ymin = y_pred_lower, ymax = y_pred_upper), fill = "orange", alpha = 0.25) +
+  # Median credible interval ribbon (narrower)
+  geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), fill = "skyblue", alpha = 0.5) +
+  # Median trajectory
+  geom_line(aes(y = mu_median), color = "blue", size = 1) +
+  # Posterior predictive median
+  # geom_line(aes(y = y_pred_median), color = "orange", linetype = "dashed", size = 1) +
+  # Observed data for this athlete
+  geom_point(data = data.frame(
+    age = unique_ages[ages_n],
+    observed = obs_perf
+  ), aes(x = age, y = observed), color = "black", size = 2) +
+  labs(title = "Athlete fit", x = "Age (Years)", y = "Performance (Seconds)") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+
+
+
+```{r}
+performance_df <- trim_sb %>% select(original_ID, AgeInt, Result)
+performance_female_df <- trim_sb_female %>% select(original_ID, AgeInt, Result)
+
+age_means <- performance_df %>%
+  group_by(AgeInt) %>%
+  summarize(mean_perf = mean(Result, na.rm = TRUE))
+
+age_female_means <- performance_female_df %>%
+  group_by(AgeInt) %>%
+  summarize(mean_perf = mean(Result, na.rm = TRUE))
+```
+
+```{r}
+p_male <- ggplot(age_means, aes(x = AgeInt, y = mean_perf)) +
+  geom_line(color = "blue", linewidth = 1) +
+  geom_point(color = "black", size = 2) +
+  labs(
+    title = "Male",
+    x = "Age (Years)",
+    y = "Mean Performance (Seconds)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Female plot
+p_female <- ggplot(age_female_means, aes(x = AgeInt, y = mean_perf)) +
+  geom_line(color = "blue", linewidth = 1) +
+  geom_point(color = "black", size = 2) +
+  labs(
+    title = "Female",
+    x = "Age (Years)",
+    y = "Mean Performance (Seconds)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p_combined <- gridExtra::arrangeGrob(p_male, p_female, ncol = 2)
+ggsave("male_female_avg_age_performance.png", p_combined,
+       width = 12, height = 4, dpi = 300)
+```
+
+
+```{r}
+fe_fit_male_3000<- readRDS(file = 'fe_fit_3000.rds')
+fe_fit_female_3000<- readRDS(file = 'fe_fit_female_3000.rds')
+
+posterior_male_fe <- extract(fe_fit_male_3000)
+posterior_female_fe <- extract(fe_fit_female_3000)
+
+
+beta_male_fe_samples <- posterior_male_fe$beta
+Sigma_male_fe_draws <- posterior_male_fe$Sigma
+
+beta_female_fe_samples <- posterior_female_fe$beta
+Sigma_female_fe_draws <- posterior_female_fe$Sigma
+```
+
+
+```{r}
+c_alt <- trim_observed_ages$all_ages[[1]] - 23.5
+X_poly <- cbind(
+  1,
+  c_alt,
+  c_alt^2,
+  c_alt^3,
+  c_alt^4
+)
+```
+
+
+
+```{r}
+mu_draws <- matrix(NA_real_, nrow = J, ncol = S)
+for (s in 1:S) mu_draws[, s] <- as.vector(X_poly %*% beta_male_fe_samples[s, ])
+
+mu_median <- apply(mu_draws, 1, median)
+mu_lower  <- apply(mu_draws, 1, quantile, 0.025)
+mu_upper  <- apply(mu_draws, 1, quantile, 0.975)
+
+df_mu <- data.frame(
+  age       = unique_ages,
+  mu_median = mu_median,
+  mu_lower  = mu_lower,
+  mu_upper  = mu_upper
+)
+
+ggplot(df_mu, aes(x = age)) +
+  geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), alpha = 0.5) +
+  geom_line(aes(y = mu_median), size = 1) +
+  labs(title = "Posterior Population Mean Trajectory",
+       x = "Age (Years)", y = "Performance (Seconds)")
+```
+
+```{r}
+make_mu_plot <- function(beta_samples, title_text) {
+  S <- nrow(beta_samples)
+  mu_draws <- matrix(NA_real_, nrow = J, ncol = S)
+  for (s in 1:S) mu_draws[, s] <- as.vector(X_poly %*% beta_samples[s, ])
+  
+  mu_median <- apply(mu_draws, 1, median)
+  mu_lower  <- apply(mu_draws, 1, quantile, 0.025)
+  mu_upper  <- apply(mu_draws, 1, quantile, 0.975)
+  
+  df_mu <- data.frame(
+    age       = unique_ages,
+    mu_median = mu_median,
+    mu_lower  = mu_lower,
+    mu_upper  = mu_upper
+  )
+  
+  ggplot(df_mu, aes(x = age)) +
+    geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), alpha = 0.5) +
+    geom_line(aes(y = mu_median)) +
+    labs(title = title_text, x = "Age (Years)", y = "Performance (Seconds)") +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+}
+
+p_male   <- make_mu_plot(beta_male_fe_samples,   "Male")
+p_female <- make_mu_plot(beta_female_fe_samples, "Female")
+
+gridExtra::grid.arrange(p_male, p_female, ncol = 2)
+
+p_combined <- gridExtra::grid.arrange(p_male, p_female, ncol = 2)
+ggsave("male_female_trajectories2.png", p_combined,
+       width = 12, height = 4, dpi = 300)
+```
+
+
+```{r}
+plot_athlete <- function(n, title_text) {
+  mu_draws <- matrix(NA, nrow = J, ncol = S)
+  for (s in 1:S) {
+    mu_draws[, s] <- as.vector(X_poly %*% beta_male_fe_samples[s, ])
+  }
+  mu_median <- apply(mu_draws, 1, median)
+  mu_lower  <- apply(mu_draws, 1, quantile, 0.025)
+  mu_upper  <- apply(mu_draws, 1, quantile, 0.975)
+  
+  obs_idx <- age_idx[n, 1:obs_count[n]]
+  y_obs <- y_matrix[n, 1:obs_count[n]]
+  
+  df_mu <- data.frame(
+    age = unique_ages,
+    mu_median = mu_median,
+    mu_lower = mu_lower,
+    mu_upper = mu_upper
+  )
+  
+  df_obs <- data.frame(
+    age = unique_ages[obs_idx],
+    observed = y_obs
+  )
+
+  ggplot(df_mu, aes(x = age)) +
+    geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), fill = "skyblue", alpha = 0.5) +
+    geom_line(aes(y = mu_median), color = "blue", size = 1) +
+    geom_point(data = df_obs, aes(x = age, y = observed), color = "black", size = 2) +
+    ylim(9.56, 11.1) +
+    labs(title = title_text, x = "Age (Years)", y = "Performance (Seconds)") +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+
+```{r}
+plot_conditional <- function(n) {
+  k <- obs_count[n]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs   <- y_matrix[n, 1:k]
+  
+  all_idx  <- 1:J
+  miss_idx <- setdiff(all_idx, obs_idx)
+  S <- nrow(beta_samples)
+  
+  pred_draws_all <- matrix(NA_real_, nrow = J, ncol = S)
+  
+  for (s in 1:S) {
+    mu    <- as.vector(X_poly %*% beta_samples[s, ])
+    Sigma <- Sigma_samples[s, , ]
+    
+    mu_obs <- mu[obs_idx]
+    S_oo   <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    r      <- y_obs - mu_obs
+    
+    Q_oo   <- solve(S_oo)
+    Qr     <- Q_oo %*% r
+    qdiag  <- diag(Q_oo)
+    
+    mu_loo  <- as.numeric(y_obs - Qr / qdiag)
+    var_loo <- 1 / qdiag
+    y_obs_pred <- rnorm(k, mean = mu_loo, sd = sqrt(pmax(var_loo, 0)))
+    
+    mu_miss <- mu[miss_idx]
+    S_om    <- Sigma[obs_idx,  miss_idx, drop = FALSE]
+    S_mo    <- t(S_om)
+    S_mm    <- Sigma[miss_idx, miss_idx, drop = FALSE]
+    
+    alpha <- solve(S_oo, r)
+    tmp   <- solve(S_oo, S_om)
+    
+    mu_cond    <- as.vector(mu_miss + S_mo %*% alpha)
+    Sigma_cond <- S_mm - S_mo %*% tmp
+    
+    y_miss_pred <- as.vector(mvrnorm(1, mu_cond, Sigma_cond))
+    
+    draw_s <- rep(NA_real_, J)
+    draw_s[obs_idx]  <- y_obs_pred
+    draw_s[miss_idx] <- y_miss_pred
+    pred_draws_all[, s] <- draw_s
+  }
+  
+  pred_median <- apply(pred_draws_all, 1, median, na.rm = TRUE)
+  pred_lower  <- apply(pred_draws_all, 1, quantile, 0.025, na.rm = TRUE)
+  pred_upper  <- apply(pred_draws_all, 1, quantile, 0.975, na.rm = TRUE)
+  
+  df_pred <- data.frame(
+    age    = unique_ages,
+    median = pred_median,
+    lower  = pred_lower,
+    upper  = pred_upper
+  )
+  
+  df_obs <- data.frame(
+    age      = unique_ages[obs_idx],
+    observed = y_obs
+  )
+  
+  ggplot(df_pred, aes(x = age)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "blue", alpha = 0.3) +
+    geom_line(aes(y = median), color = "blue", linewidth = 1) +
+    geom_point(data = df_obs, aes(y = observed), color = "black", size = 2) +
+    ylim(9.56, 11.1) +
+    labs(x = "Age", y = "Performance")
+}
+```
+
+```{r}
+n_vec <- c(28, 171, 39)
+titles_vec <- c("Athlete 1", "Athlete 2", "Athlete 3")
+plots_avg <- Map(plot_athlete, n_vec, titles_vec)
+
+plots_pred <- lapply(n_vec, plot_conditional)
+
+plot_list_all <- c(plots_avg, plots_pred)
+
+grid.arrange(grobs = plot_list_all, nrow = 2, ncol = 3)
+
+p_combined <- arrangeGrob(grobs = plot_list_all, nrow = 2, ncol = 3)
+
+ggsave("3_athlete_dist.png", p_combined,
+       width = 12, height = 8, dpi = 300)
+```
+

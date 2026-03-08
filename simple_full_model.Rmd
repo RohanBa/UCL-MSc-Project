@@ -1,0 +1,860 @@
+---
+title: "simple_full_model"
+author: '18004789'
+date: "2025-07-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(rstudioapi)
+library(rstan)
+library(shinystan)
+library(ggplot2)
+library(bayesplot)
+library(MASS)
+library(gridExtra)
+```
+
+```{r}
+X100M_male <- read_excel("100m/100m/100M_male.xls")
+X100M_male$Gender <- "M"
+# Add a new column 'Year' by extracting the year from 'Date'
+X100M_male$Year <- as.numeric(format(X100M_male$Date, "%Y"))
+
+sb_df <- X100M_male %>%
+  group_by(original_ID, Year) %>%
+  # Only keep if there are at least 3 performances in that year
+  filter(n() >= 3) %>%
+  slice(which.min(Result)) %>%
+  ungroup()
+sb_df$AgeInt <- sb_df$Year - as.numeric(format(sb_df$DOB, "%Y"))
+
+trim_sb <- sb_df %>%
+  group_by(AgeInt) %>%
+  filter(AgeInt >= 17, AgeInt <= 30) %>% # now consider only ages 17 to 30
+  ungroup()
+
+# cutting down size of data
+# Include athletes with at least 5 years of SBs
+trim_sb <- trim_sb %>%
+  group_by(original_ID) %>%
+  filter(n() >= 5) %>%
+  ungroup()
+
+# Restrict to elite athletes
+
+elite_athletes <- trim_sb %>%
+  group_by(original_ID) %>%
+  summarise(PB = min(Result, na.rm = TRUE)) %>%
+  filter(PB < 10.5)
+
+# Keep only SBs for elite athletes
+trim_sb <- trim_sb %>%
+  semi_join(elite_athletes, by = "original_ID")
+```
+
+```{r}
+# Create a list of observed ages for each athlete
+trim_observed_ages <-trim_sb %>%
+  group_by(original_ID, Competitor) %>%
+  summarise(M_i = list(AgeInt), count = n(), y_i = list(Result)) %>%
+  ungroup()
+
+trim_observed_ages$all_ages <- list(sort(unique(trim_sb$AgeInt)))
+
+# getting indicies of observed ages in relation to the vector of all unique ages
+trim_observed_ages$age_indices <- lapply(trim_observed_ages$M_i, function(x) {
+  match(x, trim_observed_ages$all_ages[[1]])
+})
+```
+
+```{r}
+# Preparing data for stan model
+
+J <- length(unique(trim_sb$AgeInt))
+N <- nrow(trim_observed_ages)
+# Maximum number of observations any athlete has
+max_obs <- max(trim_observed_ages$count)
+
+# Putting the vectors of ageIndicies into an Nxmax_obs matrix
+age_idx <- matrix(1, nrow = N, ncol = max_obs)
+for (i in 1:N) {
+  inds <- trim_observed_ages$age_indices[[i]]
+  len_i <- length(inds)
+  age_idx[i, 1:len_i] <- inds
+}
+
+head(age_idx)
+
+# Putting the vectors of results into an Nxmax_obs matrix
+y_matrix <- matrix(0, nrow = N, ncol = max_obs)
+for(i in 1:N) {
+  obs_values <- trim_observed_ages$y_i[[i]]
+  n_obs <- length(obs_values)
+  y_matrix[i, 1:n_obs] <- obs_values
+}
+
+head(y_matrix)
+```
+
+```{r}
+# Build the Stan data list:
+stan_data <- list(
+  N = N,                # number of athletes
+  J = J,                # number of unique ages
+  max_obs = max_obs,    # maximum observations per subject
+  obs_count = trim_observed_ages$count,  # vector of observation counts per subject
+  age_idx = age_idx,    # matrix of precomputed age indices per subject
+  y = y_matrix,         # padded y matrix with athletes' observed results
+  unique_ages = trim_observed_ages$all_ages[[1]],  # vector of unique ages 
+  center_age = 23.5
+)
+
+
+simple_full <- stan_model('simple_full.stan')
+```
+
+```{r}
+init_fun <- function() {
+  list(
+    sigma = rep(0.1, stan_data$J),
+    Omega = diag(1, stan_data$J),
+    beta = as.vector(fixed_model$coefficients)
+  )
+}
+
+fe_fit_3000  <- sampling(simple_full, data = stan_data, init = init_fun, iter = 3000, chains = 1)
+
+# saveRDS(fe_fit_3000, "fe_fit_3000.rds")
+# simple_full_fit_reduced<- readRDS(file = 'simple_full_fit_reduced_3000.rds')
+```
+```{r}
+fe_fit_3000<- readRDS(file = 'fe_fit_3000.rds')
+```
+
+```{r}
+launch_shinystan(fe_fit_3000)
+```
+
+```{r}
+unique_ages = trim_observed_ages$all_ages[[1]]
+obs_count = trim_observed_ages$count
+
+# Reduced athletes, age 17 to 30, 3000 iterations
+posterior_full <- extract(fe_fit_3000)
+
+beta_samples <- posterior_full$beta
+
+# Posterior covariance matrix
+Sigma_samples <- posterior_full$Sigma
+Sigma_mean <- apply(Sigma_samples, c(2,3), mean)
+print(Sigma_mean)
+```
+```{r}
+sigma_j_samples <- posterior_full$sigma
+apply(sigma_j_samples, 2, mean)           # posterior mean per age
+apply(sigma_j_samples, 2, quantile, c(0.025, 0.975)) 
+```
+
+
+
+```{r}
+# Posterior corr matrix
+Omega_draws <- posterior_full$Omega
+omega_mean <- apply(Omega_draws, c(2,3), mean)
+print(omega_mean)
+```
+
+
+```{r}
+# Residuals plot won't be good since we just consider posterior mean which is just fixed effect
+c_alt <- trim_observed_ages$all_ages[[1]] - 23.5
+X_poly <- cbind(
+  1,
+  c_alt,
+  c_alt^2,
+  c_alt^3,
+  c_alt^4
+)
+
+summary_fit <- summary(fe_fit_3000)$summary
+beta_hat <- summary_fit[grep("^beta\\[", rownames(summary_fit)), "mean"]
+
+
+residuals <- list()
+for (n in 1:N) {
+  k <- trim_observed_ages$count[n]
+  for (i in 1:k) {
+    age_col <- age_idx[n, i]
+    mu_hat <- as.numeric(X_poly[age_col, ] %*% beta_hat)
+    residuals[[length(residuals) + 1]] <- y_matrix[n, i] - mu_hat
+  }
+}
+
+# inference on residuals
+residuals_vec <- unlist(residuals)
+hist(residuals_vec, breaks = 30, main = "Histogram of Residuals of simpler full model", xlab = "Residual")
+qqnorm(residuals_vec)
+qqline(residuals_vec)
+```
+
+
+```{r}
+set.seed(123)
+
+n_draws <- 1500
+
+# Posterior for the mean curve (no Sigma)
+mu_draws <- matrix(NA, nrow = J, ncol = n_draws)
+for (s in 1:n_draws) {
+  mu_draws[, s] <- as.vector(X_poly %*% beta_samples[s, ])
+}
+mu_median <- apply(mu_draws, 1, median)
+mu_lower  <- apply(mu_draws, 1, quantile, 0.025)
+mu_upper  <- apply(mu_draws, 1, quantile, 0.975)
+
+y_rep_draws <- matrix(NA, nrow = J, ncol = n_draws)
+for (s in 1:n_draws) {
+  mu_s <- as.numeric(mu_draws[, s])
+  Sigma_s <- as.matrix(Sigma_samples[s, , ])
+  # Draw a synthetic vector of performances at all ages for this athlete
+  y_rep_draws[, s] <- MASS::mvrnorm(1, mu = mu_s, Sigma = Sigma_s)
+}
+y_pred_median <- apply(y_rep_draws, 1, median)
+y_pred_lower  <- apply(y_rep_draws, 1, quantile, 0.025)
+y_pred_upper  <- apply(y_rep_draws, 1, quantile, 0.975)
+
+n <- 44   #240 279
+ages_n <- age_idx[n, 1:obs_count[n]]
+obs_perf <- y_matrix[n, 1:obs_count[n]]
+
+plot_df <- data.frame(
+  age = unique_ages,
+  mu_median = mu_median,
+  mu_lower = mu_lower,
+  mu_upper = mu_upper,
+  y_pred_median = y_pred_median,
+  y_pred_lower = y_pred_lower,
+  y_pred_upper = y_pred_upper
+)
+
+ggplot(plot_df, aes(x = age)) +
+  # Predictive interval ribbon (widest, includes Sigma)
+  # geom_ribbon(aes(ymin = y_pred_lower, ymax = y_pred_upper), fill = "orange", alpha = 0.25) +
+  # Median credible interval ribbon (narrower)
+  geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), fill = "skyblue", alpha = 0.5) +
+  # Median trajectory
+  geom_line(aes(y = mu_median), color = "blue", size = 1) +
+  # Posterior predictive median
+  # geom_line(aes(y = y_pred_median), color = "orange", linetype = "dashed", size = 1) +
+  # Observed data for this athlete
+  geom_point(data = data.frame(
+    age = unique_ages[ages_n],
+    observed = obs_perf
+  ), aes(x = age, y = observed), color = "black", size = 2) +
+  labs(title = "Athlete fit", x = "Age (Years)", y = "Performance (Seconds)") +
+  theme(
+    plot.title = element_text(hjust = 0.5)  # 👈 centers the title
+  )
+
+```
+
+```{r}
+# n <- 6          # athlete
+# k <- obs_count[n]           # number of observed ages for this athlete
+# obs_idx <- age_idx[n, 1:k]  # indices of observed ages (e.g., [1, 2, 5, 7])
+# y_obs <- y_matrix[n, 1:k]
+# 
+# S <- nrow(beta_samples)
+# mu_draws <- matrix(NA, nrow = J, ncol = S)
+# for (s in 1:S) {
+#   mu_draws[, s] <- as.vector(X_poly %*% beta_samples[s, ])
+# }
+# mu_median <- apply(mu_draws, 1, median)
+# mu_mean <- apply(mu_draws, 1, mean)
+# 
+# df_mu <- data.frame(
+#   age = unique_ages,
+#   mu_median = mu_median,
+#   mu_mean = mu_mean
+# )
+# 
+# df_obs <- data.frame(
+#   age = unique_ages[obs_idx],
+#   observed = y_obs
+# )
+# 
+# ggplot() +
+#   geom_line(data = df_mu, aes(x = age, y = mu_median), color = "blue", size = 1) +
+#   #geom_line(data = df_mu, aes(x = age, y = mu_mean), color = "red", size = 1) +
+#   geom_point(data = df_obs, aes(x = age, y = observed), color = "black", size = 3) +
+#   labs(title = paste("Observed data for athlete", n),
+#        x = "Age", y = "Performance")
+
+plot_athlete <- function(n) {
+  k <- obs_count[n]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+
+  # Population mean curve
+  mu_draws <- matrix(NA, nrow = J, ncol = S)
+  for (s in 1:S) {
+    mu_draws[, s] <- as.vector(X_poly %*% beta_samples[s, ])
+  }
+  mu_median <- apply(mu_draws, 1, median)
+  df_mu <- data.frame(
+    age = unique_ages,
+    mu_median = mu_median
+  )
+  df_obs <- data.frame(
+    age = unique_ages[obs_idx],
+    observed = y_obs
+  )
+
+  ggplot() +
+    geom_line(data = df_mu, aes(x = age, y = mu_median), color = "blue", size = 1) +
+    geom_point(data = df_obs, aes(x = age, y = observed), color = "black", size = 1) +
+    labs(x = "Age", y = "Performance")
+}
+
+n_vec <- 1:25
+plot_list <- lapply(n_vec, plot_athlete)
+
+grid.arrange(grobs = plot_list, nrow = 5, ncol = 5)
+
+```
+
+```{r}
+# OLD
+set.seed(123)
+# conditional predictive distribution
+# linear interpolation happens in the plot for gappy cases
+
+n <- 171       # athlete
+k <- obs_count[n]     # number of observed ages for this athlete
+obs_idx <- age_idx[n, 1:k]          # indices of observed ages (e.g., [1, 2, 5, 7])
+y_obs <- y_matrix[n, 1:k]           # observed performances
+
+# The ages to predict performance for (the "future" ages)
+all_age_idx <- 1:J
+future_idx <- setdiff(all_age_idx, obs_idx)    # indices of unobserved ages for this athlete
+
+S <- nrow(beta_samples)
+
+# Matrix to store posterior predictive samples for each future age
+cond_pred_draws <- matrix(NA, nrow = length(future_idx), ncol = S)
+
+for (s in 1:S) {
+  mu <- as.vector(X_poly %*% beta_samples[s, ])
+  Sigma <- Sigma_samples[s, , ]
+  
+  # Partition means
+  mu_obs <- mu[obs_idx]
+  mu_pred <- mu[future_idx]
+  
+  # Partition covariance
+  Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+  Sigma_21 <- Sigma[obs_idx, future_idx, drop = FALSE]
+  Sigma_12 <- Sigma[future_idx, obs_idx, drop = FALSE]
+  Sigma_11 <- Sigma[future_idx, future_idx, drop = FALSE]
+  
+  # Conditional mean and covariance
+  mu_cond <- mu_pred + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs)
+  Sigma_cond <- Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21)
+  
+  # Sample from conditional predictive distribution
+  cond_pred_draws[, s] <- as.vector(mvrnorm(1, mu_cond, Sigma_cond))
+}
+
+# Summarize posterior predictive at each future age
+cond_pred_median <- apply(cond_pred_draws, 1, median)
+cond_pred_lower  <- apply(cond_pred_draws, 1, quantile, 0.025)
+cond_pred_upper  <- apply(cond_pred_draws, 1, quantile, 0.975)
+
+future_ages <- unique_ages[future_idx]
+
+df_pred <- data.frame(
+  age = future_ages,
+  median = cond_pred_median,
+  lower = cond_pred_lower,
+  upper = cond_pred_upper
+)
+
+df_obs <- data.frame(
+  age = unique_ages[obs_idx],
+  observed = y_obs
+)
+
+ggplot(df_pred, aes(x = age)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "blue", alpha = 0.3) +
+  geom_line(aes(y = median), color = "blue", size = 1) +
+  geom_point(data = df_obs, aes(x = age, y = observed), color = "black", size = 2) +
+  labs(title = paste("Conditional predictive for athlete", n),
+       x = "Age", y = "Performance")
+```
+
+```{r}
+set.seed(123)
+
+n <- 39
+k <- obs_count[n]
+obs_idx <- age_idx[n, 1:k]
+y_obs   <- y_matrix[n, 1:k]
+
+all_idx  <- 1:J
+miss_idx <- setdiff(all_idx, obs_idx)
+S <- nrow(beta_samples)
+
+pred_draws_all <- matrix(NA_real_, nrow = J, ncol = S)
+
+for (s in 1:S) {
+  mu    <- as.vector(X_poly %*% beta_samples[s, ])
+  Sigma <- Sigma_samples[s, , ]
+
+  mu_obs <- mu[obs_idx]
+  S_oo   <- Sigma[obs_idx, obs_idx, drop = FALSE]
+  r      <- y_obs - mu_obs
+
+  Q_oo   <- solve(S_oo)
+  Qr     <- Q_oo %*% r
+  qdiag  <- diag(Q_oo)
+
+  mu_loo  <- as.numeric(y_obs - Qr / qdiag)   # element-wise divide
+  var_loo <- 1 / qdiag
+
+  y_obs_pred <- rnorm(k, mean = mu_loo, sd = sqrt(pmax(var_loo, 0)))
+
+  mu_miss <- mu[miss_idx]
+  S_om    <- Sigma[obs_idx,  miss_idx, drop = FALSE]
+  S_mo    <- t(S_om)
+  S_mm    <- Sigma[miss_idx, miss_idx, drop = FALSE]
+
+  alpha <- solve(S_oo, r)
+  tmp   <- solve(S_oo, S_om)
+
+  mu_cond    <- as.vector(mu_miss + S_mo %*% alpha)
+  Sigma_cond <- S_mm - S_mo %*% tmp
+
+  y_miss_pred <- as.vector(mvrnorm(1, mu_cond, Sigma_cond))
+  
+  draw_s <- rep(NA_real_, J)
+  draw_s[obs_idx]  <- y_obs_pred
+  draw_s[miss_idx] <- y_miss_pred
+  pred_draws_all[, s] <- draw_s
+}
+
+# Summaries for ribbons/line
+pred_median <- apply(pred_draws_all, 1, median, na.rm = TRUE)
+pred_lower  <- apply(pred_draws_all, 1, quantile, 0.025, na.rm = TRUE)
+pred_upper  <- apply(pred_draws_all, 1, quantile, 0.975, na.rm = TRUE)
+
+df_pred <- data.frame(
+  age    = unique_ages,
+  median = pred_median,
+  lower  = pred_lower,
+  upper  = pred_upper
+)
+
+df_obs <- data.frame(
+  age      = unique_ages[obs_idx],
+  observed = y_obs
+)
+
+ggplot(df_pred, aes(x = age)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "blue", alpha = 0.3) +
+  geom_line(aes(y = median), color = "blue", linewidth = 1) +
+  geom_point(data = df_obs, aes(y = observed), color = "black", size = 2) +
+  labs(title = paste("Conditional predictive for athlete", n),
+       x = "Age", y = "Performance")
+```
+
+```{r}
+plot_athlete <- function(n) {
+  mu_draws <- matrix(NA, nrow = J, ncol = S)
+  for (s in 1:S) {
+    mu_draws[, s] <- as.vector(X_poly %*% beta_samples[s, ])
+  }
+  mu_median <- apply(mu_draws, 1, median)
+  mu_lower  <- apply(mu_draws, 1, quantile, 0.025)
+  mu_upper  <- apply(mu_draws, 1, quantile, 0.975)
+  
+  obs_idx <- age_idx[n, 1:obs_count[n]]
+  y_obs <- y_matrix[n, 1:obs_count[n]]
+  
+  df_mu <- data.frame(
+    age = unique_ages,
+    mu_median = mu_median,
+    mu_lower = mu_lower,
+    mu_upper = mu_upper
+  )
+  
+  df_obs <- data.frame(
+    age = unique_ages[obs_idx],
+    observed = y_obs
+  )
+
+  ggplot(df_mu, aes(x = age)) +
+    geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), fill = "skyblue", alpha = 0.5) +
+    geom_line(aes(y = mu_median), color = "blue", size = 1) +
+    geom_point(data = df_obs, aes(x = age, y = observed), color = "black", size = 2) +
+    labs(x = "Age", y = "Performance")
+}
+
+n_vec <- c(44, 171, 190)
+plot_list <- lapply(n_vec, plot_athlete)
+grid.arrange(grobs = plot_list, nrow = 1, ncol = 3)
+```
+
+
+
+
+
+
+```{r}
+# for a particular athlete, find the age at which high performance is most likely < 9.8 
+# find maximum age_idx for each athlete, then only choose athletes for max_age_idx<= 8 (24 years)
+age_idx_maxes <- apply(age_idx, 1, max)
+athlete_indices <- which(age_idx_maxes <= 8)
+```
+
+
+```{r}
+set.seed(123)
+n <- 171
+future_ages_vec <- 25:30
+future_idx <- which(unique_ages %in% future_ages_vec)  # indices in unique_ages
+y_thresh <- 9.9
+k <- obs_count[n]     # number of observed ages for this athlete
+obs_idx <- age_idx[n, 1:k]          # indices of observed ages (e.g., [1, 2, 5, 7])
+y_obs <- y_matrix[n, 1:k]           # observed performances
+
+S <- nrow(beta_samples)
+
+# Matrix to store posterior predictive samples for each future age
+future_samples <- matrix(NA, nrow = length(future_idx), ncol = S)
+
+for (s in 1:S) {
+  mu <- as.vector(X_poly %*% beta_samples[s, ])
+  Sigma <- Sigma_samples[s, , ]
+  
+  # Partition means
+  mu_obs <- mu[obs_idx]
+  mu_pred <- mu[future_idx]
+  
+  # Partition covariance
+  Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+  Sigma_21 <- Sigma[obs_idx, future_idx, drop = FALSE]
+  Sigma_12 <- Sigma[future_idx, obs_idx, drop = FALSE]
+  Sigma_11 <- Sigma[future_idx, future_idx, drop = FALSE]
+  
+  # Conditional mean and covariance
+  mu_cond <- mu_pred + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs)
+  Sigma_cond <- Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21)
+  
+  y_pred <- as.vector(mvrnorm(1, mu_cond, Sigma_cond))
+  
+  future_samples[, s] <- y_pred
+}
+
+prob_elite <- apply(future_samples, 1, function(y) mean(y < y_thresh))
+
+
+# Display results
+data.frame(
+  age = unique_ages[future_idx],
+  prob_elite = prob_elite
+)
+```
+
+
+```{r}
+future_ages_vec <- 25:30
+future_idx <- which(unique_ages %in% future_ages_vec)  # indices in unique_ages
+S <- nrow(beta_samples)
+
+y_thresh <- 9.9
+
+prob_results <- list()
+
+for (n in athlete_indices){
+  set.seed(123)
+  k <- obs_count[n]
+  obs_idx <- age_idx[n, 1:k]          # indices of observed ages (e.g., [1, 2, 5, 7])
+  y_obs <- y_matrix[n, 1:k]           # observed performances
+  
+  future_samples <- matrix(NA, nrow = length(future_idx), ncol = S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_samples[s, ])
+    Sigma <- Sigma_samples[s, , ]
+    
+    # Partition means
+    mu_obs <- mu[obs_idx]
+    mu_pred <- mu[future_idx]
+    
+    # Partition covariance
+    Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    Sigma_21 <- Sigma[obs_idx, future_idx, drop = FALSE]
+    Sigma_12 <- Sigma[future_idx, obs_idx, drop = FALSE]
+    Sigma_11 <- Sigma[future_idx, future_idx, drop = FALSE]
+    
+    # Conditional mean and covariance
+    mu_cond <- mu_pred + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs)
+    Sigma_cond <- Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21)
+    
+    y_pred <- as.vector(mvrnorm(1, mu_cond, Sigma_cond))
+    
+    future_samples[, s] <- y_pred
+  }
+  
+  prob_elite <- apply(future_samples, 1, function(y) mean(y < y_thresh))
+  prob_results[[as.character(n)]] <- data.frame(
+    athlete_idx = n,
+    age = unique_ages[future_idx],
+    prob_elite = prob_elite
+  )
+  
+}
+
+elite_perf_fe_df <- do.call(rbind, prob_results)
+elite_perf_fe_df$Competitor <- trim_observed_ages$Competitor[elite_perf_fe_df$athlete_idx]
+```
+
+
+```{r}
+# verifying prediction for athletes that we have observed results for past age 25
+# if we use this, there are better verifications for ages past 26
+
+future_ages_vec <- 25:30
+future_idx <- which(unique_ages %in% future_ages_vec)  # indices in unique_ages
+athlete_indices_long <- which(apply(age_idx, 1, function(x) all(future_idx %in% x)))
+
+prob_results_long <- list()
+compare_results_long <- list()
+
+y_thresh <- 9.9
+
+for (n in athlete_indices_long){
+  set.seed(123)
+  # Only use data up to and including age 24 for conditioning
+  valid_idx <- age_idx[n, 1:obs_count[n]]
+  # number of instances that age_idx is less than 24 years 
+  k <- sum(valid_idx <= 8)
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+  
+  # Actual future observed results at ages 25-30:
+  # Find column positions in age_idx[n, ] that match future_idx
+  match_cols <- match(future_idx, age_idx[n, ])
+  actual_future <- rep(NA, length(future_idx))
+  actual_future[!is.na(match_cols)] <- y_matrix[n, na.omit(match_cols)]
+  
+  future_samples <- matrix(NA, nrow = length(future_idx), ncol = S)
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_samples[s, ])
+    Sigma <- Sigma_samples[s, , ]
+    mu_obs <- mu[obs_idx]
+    mu_pred <- mu[future_idx]
+    
+    if (k >= 1) {
+      Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+      Sigma_21 <- Sigma[obs_idx, future_idx, drop = FALSE]
+      Sigma_12 <- Sigma[future_idx, obs_idx, drop = FALSE]
+      Sigma_11 <- Sigma[future_idx, future_idx, drop = FALSE]
+      
+      mu_cond <- mu_pred + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs)
+      Sigma_cond <- Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21)
+      #Sigma_cond <- Sigma_cond + diag(1e-8, nrow(Sigma_cond))
+    } else {
+      # no data ≤ 24 → unconditional predictive
+      mu_cond <- mu_pred
+      Sigma_cond <- Sigma[future_idx, future_idx, drop = FALSE]
+    }
+      
+    y_pred <- as.vector(mvrnorm(1, mu_cond, Sigma_cond))
+    
+    future_samples[, s] <- y_pred
+  }
+  
+  prob_elite <- apply(future_samples, 1, function(y) mean(y < y_thresh))
+  
+  # Add actual observed
+  compare_results_long[[as.character(n)]] <- data.frame(
+    athlete_idx = n,
+    age = unique_ages[future_idx],
+    prob_elite = prob_elite,
+    actual_result = actual_future,
+    elite_achieved = actual_future < y_thresh
+  )
+}
+
+elite_compare_fe_df <- do.call(rbind, compare_results_long)
+elite_compare_fe_df$Competitor <- trim_observed_ages$Competitor[elite_compare_fe_df$athlete_idx]
+```
+
+
+
+```{r}
+# Out of current 23 yr olds, whose gonna be the fastest at age a = 28
+
+# choose athletes for max_age_idx== 7 (23 years), (not necessarily 21 today since season's best might not have been recorded- but leave for later)
+athlete_indicies_23 <- which(age_idx_maxes == 7)
+
+print(athlete_indicies_23)
+
+trim_observed_ages$Competitor[athlete_indicies_23]
+```
+
+```{r}
+set.seed(123)
+# commpare 2 athletes: 190, 304
+a <- which(unique_ages == 27)
+pair_ids <- c(304, 390)
+pair_pred <- matrix(NA, nrow = 2, ncol = S)
+
+for (i in seq_along(pair_ids)) {
+  
+  n <- pair_ids[i]
+  k <- obs_count[n]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_samples[s, ])
+    Sigma <- Sigma_samples[s, , ]
+    mu_obs <- mu[obs_idx]
+    mu_a <- mu[a]
+    Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    Sigma_21 <- Sigma[obs_idx, a, drop = FALSE]
+    Sigma_12 <- Sigma[a, obs_idx, drop = FALSE]
+    Sigma_11 <- Sigma[a, a, drop = FALSE]
+    
+    # singular age being predicted, so univariate case
+    mu_cond <- as.numeric(mu_a + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs))
+    sigma2_cond <- as.numeric(Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21))
+    pair_pred[i, s] <- rnorm(1, mu_cond, sqrt(sigma2_cond))
+  }
+}
+
+pair_win_counts <- pair_pred[1, ] < pair_pred[2, ]
+mean(pair_win_counts)
+```
+
+```{r}
+set.seed(123)
+a <- which(unique_ages == 28)
+
+y_future_23 <- matrix(NA, nrow = length(athlete_indicies_23), ncol = S)
+
+for (ii in seq_along(athlete_indicies_23)) {
+  n <- athlete_indicies_23[ii]
+  k <- obs_count[n]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_samples[s, ])
+    Sigma <- Sigma_samples[s, , ]
+    mu_obs <- mu[obs_idx]
+    mu_a <- mu[a]
+    Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    Sigma_21 <- Sigma[obs_idx, a, drop = FALSE]
+    Sigma_12 <- Sigma[a, obs_idx, drop = FALSE]
+    Sigma_11 <- Sigma[a, a, drop = FALSE]
+    
+    # singular age being predicted, so univariate case
+    mu_cond <- as.numeric(mu_a + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs))
+    sigma2_cond <- as.numeric(Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21))
+    y_future_23[ii, s] <- rnorm(1, mu_cond, sqrt(sigma2_cond))
+  }
+}
+
+# Get predicted minimum value and index for each sample
+fastest_info <- apply(y_future_23, 2, function(v) {
+  ii <- which.min(v)
+  c(athlete = athlete_indicies_23[ii], value = v[ii])
+})
+
+fastest_info <- t(fastest_info)
+colnames(fastest_info) <- c("athlete_idx", "value")
+```
+
+
+```{r}
+winners <- as.integer(fastest_info[, "athlete_idx"])
+prob_best_23_28 <- sapply(athlete_indicies_23, function(id) mean(winners == id, na.rm = TRUE))
+
+results_23_28 <- data.frame(
+  athlete_idx = athlete_indicies_23,
+  prob_best = prob_best_23_28
+)
+
+results_23_28$Competitor <- trim_observed_ages$Competitor[results_23_28$athlete_idx]
+```
+
+
+```{r}
+# Out of current athletes, who are running, who is projected to be in 2022 world champs final (1 yr ahead of dataset)
+
+current_athlete_ids <- trim_sb %>%
+  filter((2022 - as.numeric(format(DOB, "%Y"))) <= 30) %>%
+  distinct(original_ID) %>%
+  pull(original_ID)
+
+current_athlete_indicies <- which(trim_observed_ages$original_ID %in% current_athlete_ids)
+```
+
+```{r}
+set.seed(123)
+y_world_final <- matrix(NA, nrow = length(current_athlete_indicies), ncol = S)
+
+for (ii in seq_along(current_athlete_indicies)) {
+  n <- current_athlete_indicies[ii]
+  k <- obs_count[n]
+  obs_idx <- age_idx[n, 1:k]
+  y_obs <- y_matrix[n, 1:k]
+  
+  # current age + 1yr 
+  a_plus_1 <- age_idx[n, k] + 1
+  
+  for (s in 1:S) {
+    mu <- as.vector(X_poly %*% beta_samples[s, ])
+    Sigma <- Sigma_samples[s, , ]
+    
+    mu_obs <- mu[obs_idx]
+    mu_a1 <- mu[a_plus_1]
+    
+    Sigma_22 <- Sigma[obs_idx, obs_idx, drop = FALSE]
+    Sigma_21 <- Sigma[obs_idx, a_plus_1, drop = FALSE]
+    Sigma_12 <- Sigma[a_plus_1, obs_idx, drop = FALSE]
+    Sigma_11 <- Sigma[a_plus_1, a_plus_1, drop = FALSE]
+    
+    # singular age being predicted, so univariate case
+    mu_cond <- as.numeric(mu_a1 + Sigma_12 %*% solve(Sigma_22, y_obs - mu_obs))
+    sigma2_cond <- as.numeric(Sigma_11 - Sigma_12 %*% solve(Sigma_22, Sigma_21))
+    
+    y_world_final[ii, s] <-  rnorm(1, mu_cond, sqrt(sigma2_cond))
+  }
+}
+
+# For each sample (column), rank the times, rankings[ii, s]: athlete ii's rank (1 = fastest) in sample s
+# when rankings are tied, randomly allocate 
+rankings <- apply(y_world_final, 2, rank, ties.method = "random")
+
+# For each athlete, calculate the proportion of samples where their rank is ≤ 8:
+pr_top8 <- rowMeans(rankings <= 8, na.rm = TRUE)
+
+fe_results_world_final <- data.frame(
+  athlete_idx = current_athlete_indicies,
+  pr_top8 = pr_top8
+)
+
+fe_results_world_final$Competitor <- trim_observed_ages$Competitor[fe_results_world_final$athlete_idx]
+```
